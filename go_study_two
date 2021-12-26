@@ -1,0 +1,1971 @@
+RPC
+调用RPC
+GO语言调用
+rpc法则：
+1. 方法只能有两个可序列化的参数，其中第二个参数是指针类型
+2. 返回一个error类型
+3. 必须是公开的方法
+
+  定义接口规范：
+// RPC服务名字 避免重命名
+const HelloServiceName = "path/to/pkg.HelloService"
+
+// RPC服务
+type HelloServiceInterface = interface {
+    Hello(request string, reply *string) error
+}
+
+// 服务端注册服务
+func RegisterHelloService(svc HelloServiceInterface) error {
+    return rpc.RegisterName(HelloServiceName, svc)
+}
+
+// RPC客户端
+type HelloServiceClient struct {
+    *rpc.Client
+}
+
+var _ HelloServiceInterface = (*HelloServiceClient)(nil)
+
+// 客户端获取服务
+func DialHelloService(network, address string) (*HelloServiceClient, error) {
+    c, err := rpc.Dial(network, address)
+    if err != nil {
+        return nil, err
+    }
+    return &HelloServiceClient{Client: c}, nil
+}
+
+// 获取服务方法
+func (p *HelloServiceClient) Hello(request string, reply *string) error {
+    return p.Client.Call(HelloServiceName+".Hello", request, reply)
+}
+
+
+服务方：
+1. 注册服务（具体实现）
+2. 监听端口
+3. 获取链接
+4. 提供RPC服务
+type HelloService struct {}
+
+// RPC服务实现
+func (p *HelloService) Hello(request string, reply *string) error {
+    *reply = "hello:" + request
+    return nil
+}
+
+func main() {
+    // 注册服务
+    RegisterHelloService(new(HelloService))
+
+    // 监听端口
+    listener, err := net.Listen("tcp", ":1234")
+    if err != nil {
+        log.Fatal("ListenTCP error:", err)
+    }
+
+    // 获取连接
+    for {
+        conn, err := listener.Accept()
+        if err != nil {
+            log.Fatal("Accept error:", err)
+        }
+
+        // 服务
+        go rpc.ServeConn(conn)
+    }
+}
+
+
+调用方
+func main() {
+    // 获取服务
+    client, err := DialHelloService("tcp", "localhost:1234")
+    if err != nil {
+        log.Fatal("dialing:", err)
+    }
+
+    // 调用服务
+    var reply string
+    err = client.Hello("hello", &reply)
+    if err != nil {
+        log.Fatal(err)
+    }
+}
+
+跨语言调用
+GO语言支持自定义编解码，从而可以实现跨语言
+// 服务端
+go rpc.ServeCodec(jsonrpc.NewServerCodec(conn))
+// 客户端
+client := rpc.NewClientWithCodec(jsonrpc.NewClientCodec(conn))
+
+HTTP调用
+RPC建立在抽象的io.ReadWriteCloser接口上，可以通过将http请求和响应转换为rpc连接ReadWriteCloser，再完成rpc调用
+    http.HandleFunc("/jsonrpc", func(w http.ResponseWriter, r *http.Request) {
+        var conn io.ReadWriteCloser = struct {
+            io.Writer
+            io.ReadCloser
+        }{
+            ReadCloser: r.Body,
+            Writer:     w,
+        }
+
+        rpc.ServeRequest(jsonrpc.NewServerCodec(conn))
+    })
+
+    http.ListenAndServe(":1234", nil)
+
+Protobuf协议
+在XML或JSON等数据描述语言中，一般通过成员的名字来绑定对应的数据。但是Protobuf编码却是通过成员的唯一编号来绑定对应的数据，因此Protobuf编码后数据的体积会比较小
+syntax = "proto3";
+// 包名
+package main;
+// 结构体
+message String {
+    // 变量（编码）
+    string value = 1;
+}
+// 服务
+service HelloService {
+    rpc Hello (String) returns (String);
+}
+
+生成代码
+go get github.com/golang/protobuf/protoc-gen-go
+
+$ protoc --go_out=. hello.proto
+
+// 指定rpc框架
+$ protoc --go_out=plugins=grpc:. hello.proto
+
+为结构体生成一组方法
+- ProtoMessage：实现了proto.Message接口
+- Get：处理空指针的成员
+type String struct {
+    Value string `protobuf:"bytes,1,opt,name=value" json:"value,omitempty"`
+}
+
+func (m *String) Reset()         { *m = String{} }
+func (m *String) String() string { return proto.CompactTextString(m) }
+func (*String) ProtoMessage()    {}
+func (*String) Descriptor() ([]byte, []int) {
+    return fileDescriptor_hello_069698f99dd8f029, []int{0}
+}
+
+func (m *String) GetValue() string {
+    if m != nil {
+        return m.Value
+    }
+    return ""
+}
+
+自定义生成代码插件
+protobuf生成逻辑：protoc命令出现--xxx_out格式的参数
+1. 查找内置插件
+2. 查找protoc-gen-xxx命名的可执行程序
+3. 该程序是否有其他静态插件系统（如go内置了grpc插件：--go_out=plugins=grpc）
+
+go的实现逻辑：
+通过generator.RegisterPlugin来注册插件，其中插件为generator.Plugin接口
+import (
+    "github.com/golang/protobuf/protoc-gen-go/generator"
+)
+
+type netrpcPlugin struct{ *generator.Generator }
+// 插件的名字
+func (p *netrpcPlugin) Name() string                { return "netrpc" }
+// 初始化插件
+func (p *netrpcPlugin) Init(g *generator.Generator) { p.Generator = g }
+// 生成导入包
+func (p *netrpcPlugin) GenerateImports(file *generator.FileDescriptor) {
+    if len(file.Service) > 0 {
+        p.genImportCode(file)
+    }
+}
+// 生成代码
+func (p *netrpcPlugin) Generate(file *generator.FileDescriptor) {
+    for _, svc := range file.Service {
+        p.genServiceCode(svc)
+    }
+}
+
+func (p *netrpcPlugin) genImportCode(file *generator.FileDescriptor) {
+    p.P("// TODO: import code") // p.P(`import "net/rpc"`)
+}
+
+const tmplService = `自己定义的模板`
+func (p *netrpcPlugin) genServiceCode(svc *descriptor.ServiceDescriptorProto) {
+    p.P("// TODO: service code, Name = " + svc.GetName())
+    
+    spec := p.buildServiceSpec(svc)
+    var buf bytes.Buffer
+    // 基于go语言的模板来生成服务代码
+    t := template.Must(template.New("").Parse(tmplService))
+    err := t.Execute(&buf, spec)
+    p.P(buf.String())
+}
+
+这里面需要解析protobuf文件：
+func (p *netrpcPlugin) buildServiceSpec(svc *descriptor.ServiceDescriptorProto) *ServiceSpec {
+    spec := &ServiceSpec{
+        ServiceName: generator.CamelCase(svc.GetName()),
+    }
+
+    for _, m := range svc.Method {
+        spec.MethodList = append(spec.MethodList, ServiceMethodSpec{
+            MethodName:     generator.CamelCase(m.GetName()),
+            InputTypeName:  p.TypeName(p.ObjectNamed(m.GetInputType())),
+            OutputTypeName: p.TypeName(p.ObjectNamed(m.GetOutputType())),
+        })
+    }
+
+    return spec
+}
+
+导入
+func init() {
+    generator.RegisterPlugin(new(netrpcPlugin))
+}
+
+func main() {
+    g := generator.New()
+    
+    data, err := ioutil.ReadAll(os.Stdin)
+    err := proto.Unmarshal(data, g.Request)
+    
+    g.CommandLineParameters(g.Request.GetParameter())
+    g.SetPackageNames()
+    g.BuildTypeNameMap()
+    g.GenerateAllFiles()
+
+    data, err = proto.Marshal(g.Response)
+    _, err = os.Stdout.Write(data)
+}
+
+$ protoc --go-netrpc_out=plugins=netrpc:. hello.proto
+
+
+扩展
+默认值
+通过第三方插件，自定义扩展选项来加入默认值参数
+syntax = "proto3";
+package main;
+import "google/protobuf/descriptor.proto";
+
+extend google.protobuf.FieldOptions {
+    string default_string = 50000;
+    int32 default_int = 50001;
+}
+
+message Message {
+    string name = 1 [(default_string) = "gopher"];
+    int32 age = 2[(default_int) = 10];
+}
+
+字段校验
+通过第三方插件的validator.field字段来加入校验
+$ go get github.com/mwitkow/go-proto-validators/protoc-gen-govalidators
+
+syntax = "proto3";
+package main;
+import "github.com/mwitkow/go-proto-validators/validator.proto";
+
+message Message {
+    string important_string = 1 [(validator.field) = {regex: "^[a-z]{2,5}$"}];
+    int32 age = 2 [(validator.field) = {int_gt: 0, int_lt: 100}];
+}
+
+生成代码
+protoc --proto_path=${GOPATH}/src
+    --proto_path=${GOPATH}/src/github.com/google/protobuf/src 
+    --proto_path=. 
+    --govalidators_out=. 
+    --go_out=plugins=grpc:.
+    hello.proto（生成hello.validator.pb.go的文件）
+
+内部RPC
+同步调用
+func (client *Client) Call(
+    serviceMethod string, args interface{}, reply inteface{}) error {
+    
+    call := <-client.Go(serviceMethod, args, reply, make(chan *Call, 1)).Done
+    return call.Error
+}
+
+通过Client.Go方法进行一次异步调用，之后直到Call结构体的Done管道返回调用结果
+func doClientWork(client *rpc.Client) {
+    helloCall := client.Go("HelloService.Hello", "hello", new(string), nil)
+    // do some thing
+    helloCall = <-helloCall.Done
+    if err := helloCall.Error; err != nil {
+        log.Fatal(err)
+    }
+}
+
+异步调用
+构造一个表示当前调用的call变量，然后通过client.send将call的完整参数发送到RPC框架
+func (client *Client) Go(
+    serviceMethod string, args interface{}, 
+    reply interface{}, done chan *Call ) *Call {
+    
+    call := new(Call)
+    call.ServiceMethod = serviceMethod
+    call.Args = args
+    call.Reply = reply
+    call.Done = make(chan *Call, 10) // buffered.
+    
+    client.send(call)
+    return call
+}
+
+实现Watch
+数据结构
+- 使用一个map来作为内存存储kv的底层数据结构
+- 再使用一个map来存储key发生变化的watch方法
+- 还得用互斥锁，避免多个groutine修改同一个key
+
+Watch方法
+关键在于方法注入，在特定条件下去调用watch方法
+watch能够在调用方法之后进行后续操作（比如通过channel实现异步通信）
+type KVService struct {
+    m      map[string]string
+    filter map[string]func(key string)
+    mu     sync.Mutex
+}
+
+func (p *KVService) Set(kv [2]string, reply *struct{}) error {
+    p.mu.Lock()
+    defer p.mu.Unlock()
+    
+    key, value := kv[0], kv[1]
+    // 更新key触发watch方法
+    if oldValue := p.m[key]; oldValue != value {
+        for _, fn := range p.filter {
+            fn(key)
+        }
+    }
+    
+    p.m[key] = value
+    return nil
+}
+
+func (p *KVStoreService) Watch(timeoutSecond int, keyChanged *string) error {
+    ch := make(chan string, 10) // buffered
+
+    p.mu.Lock()
+    p.filter[id] = func(key string) { ch <- key }
+    p.mu.Unlock()
+
+    select {
+    // 超时
+    case <-time.After(time.Duration(timeoutSecond) * time.Second):
+        return fmt.Errorf("timeout")
+    // 更新key，调用了watch方法（在这里是直接输出）
+    case key := <-ch:
+        *keyChanged = key
+        return nil
+    }
+
+    return nil
+}
+
+RPC调用
+启动一个独立的Goroutine监控key的变化
+同步的watch调用会阻塞，直到有key发生变化或者超时
+func doClientWork(client *rpc.Client) {
+    go func() {
+        var keyChanged string
+        err := client.Call("KVStoreService.Watch", 30, &keyChanged)
+        if err != nil {
+            log.Fatal(err)
+        }
+        fmt.Println("watch:", keyChanged)
+    } ()
+
+    err := client.Call("KVStoreService.Set", [2]string{"abc", "abc-value"}, new(struct{}))
+    if err != nil {
+        log.Fatal(err)
+    }
+}
+
+反向PRC
+服务端：
+1. 先从内网主动连接到外网的TCP服务器
+2. 再提供服务
+func main() {
+    rpc.Register(new(HelloService))
+
+    for {
+        // 连接
+        conn, _ := net.Dial("tcp", "localhost:1234")
+        if conn == nil {
+            time.Sleep(time.Second)
+            continue
+        }
+        // 服务
+        rpc.ServeConn(conn)
+        conn.Close()
+    }
+}
+
+客户端：
+1. 提供TCP服务
+2. 接收连接请求
+func main() {
+    // 监听
+    listener, err := net.Listen("tcp", ":1234")
+    clientChan := make(chan *rpc.Client)
+    go func() {
+        for {
+            // 连接
+            conn, err := listener.Accept()
+            clientChan <- rpc.NewClient(conn)
+        }
+    }()
+    // 处理
+    doClientWork(clientChan)
+}
+
+func doClientWork(clientChan <-chan *rpc.Client) {
+    client := <-clientChan
+    defer client.Close()
+
+    var reply string
+    err = client.Call("HelloService.Hello", "hello", &reply)
+}
+
+上下文信息
+针对不同客户端（不同的链接）提供定制化的RPC服务
+type HelloService struct {
+    conn net.Conn
+}
+
+func main() {
+    // ...监听
+    for {
+        // 获取链接
+        conn, err := listener.Accept()
+        go func() {
+            defer conn.Close()
+            p := rpc.NewServer()
+            // 不同的链接不同的服务
+            p.Register(&HelloService{conn: conn})
+            p.ServeConn(conn)
+        } ()
+    }
+}
+
+GRPC
+特点
+- 上下文支持
+gRPC通过context.Context参数，为每个方法调用提供了上下文支持
+- 异步调用
+gRPC生成的接口并不支持异步调用。不过多个Goroutine可以共享HTTP/2链接
+服务端
+type HelloServiceServer interface {
+    Hello(context.Context, *String) (*String, error)
+}
+
+// 重新实现
+type HelloServiceImpl struct{}
+
+func (p *HelloServiceImpl) Hello(ctx context.Context, args *String) (*String, error) {
+    reply := &String{Value: "hello:" + args.GetValue()}
+    return reply, nil
+}
+
+启动rpc服务
+func main() {
+    // 创建服务端
+    grpcServer := grpc.NewServer()
+    
+    // 注册rpc服务
+    RegisterHelloServiceServer(grpcServer, new(HelloServiceImpl))
+
+    // 监听端口
+    lis, err := net.Listen("tcp", ":1234")
+    grpcServer.Serve(lis)
+}
+
+客户端
+type HelloServiceClient interface {
+    Hello(context.Context, *String, ...grpc.CallOption) (*String, error)
+}
+
+func main() {
+    // 获取连接
+    conn, err := grpc.Dial("localhost:1234", grpc.WithInsecure())
+    defer conn.Close()
+
+    // 创建客户端
+    client := NewHelloServiceClient(conn)
+    
+    // 调用rpc服务
+    reply, err := client.Hello(context.Background(), &String{Value: "hello"})
+}
+
+流特性
+grpc支持服务端和客户端的双向流，通过stream关键字引入，参数部分是接收客户端参数的流，返回值是返回给客户端的流。
+service HelloService {
+    rpc Hello (String) returns (String);
+
+    rpc ChannelFun (stream String) returns (stream String);
+}
+
+// 服务端：被客户端调用RPC之后，接收客户端的流，类似回调 服务端->客户端
+type HelloServiceServer interface {
+    ChannelFun(HelloService_ChannelServer) error
+}
+// 客户端：调用RPC服务之后，可以返回信息给服务端     客户端->服务端
+type HelloServiceClient interface {
+    ChannelFun(ctx context.Context, opts ...grpc.CallOption) (HelloService_ChannelClient, error)
+}
+
+服务端
+func (p *HelloServiceImpl) Channel(stream HelloService_ChannelServer) error {
+    for {
+        // 接收客户端的流
+        args, err := stream.Recv()
+        if err != nil {
+            // 客户端被关闭
+            if err == io.EOF {
+                return nil
+            }
+            return err
+        }
+
+        reply := &String{Value: "hello:" + args.GetValue()}
+        // 发送客户端的流
+        err = stream.Send(reply)
+    }
+}
+
+客户端
+func main(){
+    stream, err := client.Channel(context.Background())
+    // 发送给服务端的流
+    go func() {
+        stream.Send(&String{Value: "hi"})
+    }()
+    
+    // 接收服务端的流
+    reply, err := stream.Recv()
+    if err != nil {
+        // 服务端退出
+        if err == io.EOF {
+            break
+        }
+    }    
+}
+
+发布和订阅
+借助"github.com/moby/moby/pkg/pubsub" 实现
+（订阅者：服务端的单向流，只有服务端接收流；客户端没有接收只有发送）
+service PubsubService {
+    rpc Publish (String) returns (String);
+    rpc Subscribe (String) returns (stream String);
+}
+
+
+服务端：
+- 发布：正常发布
+- 订阅：接收客户端的流信息作为参数
+客户端：
+- 发布：正常发布
+- 订阅：调用了 发布-订阅 服务之后，将流回传给客户端
+type PubsubServiceServer interface {
+    Publish(context.Context, *String) (*String, error)
+    // client->server
+    Subscribe(*String, PubsubService_SubscribeServer) error
+}
+type PubsubServiceClient interface {
+    Publish(context.Context, *String, ...grpc.CallOption) (*String, error)
+    // client->server
+    Subscribe(context.Context, *String, ...grpc.CallOption) (PubsubService_SubscribeClient, error)
+}
+
+type PubsubService_SubscribeServer interface {
+    Send(*String) error
+    grpc.ServerStream
+}
+
+服务
+// 初始化 『发布-订阅』 服务的媒介(publisher)
+type PubsubService struct {
+    pub *pubsub.Publisher
+}
+func NewPubsubService() *PubsubService {
+    return &PubsubService{pub: pubsub.NewPublisher(100*time.Millisecond, 10)}
+}
+
+// 利用publisher发布
+func (p *PubsubService) Publish(ctx context.Context, arg *String) (*String, error) {
+    p.pub.Publish(arg.GetValue())
+    return &String{}, nil
+}
+
+// 利用publisher订阅指定topic
+// arg => topic
+// 接收到信息之后，回传到流
+func (p *PubsubService) Subscribe(arg *String, stream PubsubService_SubscribeServer) error {
+    ch := p.pub.SubscribeTopic(func(v interface{}) bool {
+        // 指定topic
+        if key, ok := v.(string); ok {
+            if strings.HasPrefix(key,arg.GetValue()) {
+                return true
+            }
+        }
+        return false
+    })
+
+    // 从管道获取信息写进流里
+    for v := range ch {
+        // client->sever
+        if err := stream.Send(&String{Value: v.(string)}); err != nil {
+            return err
+        }
+    }
+
+    return nil
+}
+
+
+客户端A发送信息
+func main() {
+    // 创建链接
+    conn, err := grpc.Dial("localhost:1234", grpc.WithInsecure())
+    defer conn.Close()
+
+    // 初始化客户端A
+    client := NewPubsubServiceClient(conn)
+
+    // 对topic发送信息
+    _, err = client.Publish(context.Background(), &String{Value: "golang: hello Go"})
+}
+
+客户端B接收信息
+func main() {
+    // 创建链接
+    conn, err := grpc.Dial("localhost:1234", grpc.WithInsecure())
+    defer conn.Close()
+
+    // 初始化客户端B
+    client := NewPubsubServiceClient(conn)
+    
+    // 订阅topic
+    stream, err := client.Subscribe(context.Background(), &String{Value: "golang:"})
+    for {
+        // 获取信息
+        reply, err := stream.Recv()
+        // A关闭链接
+        if err != nil {
+            if err == io.EOF {
+                break
+            }
+        }
+        fmt.Println(reply.GetValue())
+    }
+}
+
+安全认证
+RPC连接的安全认证——证书
+在没有安全认证的时候，所有信息都是明文
+    // 服务端
+    grpcServer := grpc.NewServer()    
+    lis, err := net.Listen("tcp", ":1234")
+    grpcServer.Serve(lis)
+    // 客户端
+    conn, err := grpc.Dial("localhost:1234", grpc.WithInsecure())
+
+可以通过本地openssl命令生成证书
+$ openssl genrsa -out server.key 2048（私钥文件）
+$ openssl req -new -x509 -days 3650
+    -subj "/C=GB/L=China/O=grpc-server/CN=server.grpc.io"（服务器名称）
+    -key server.key（私钥文件）
+    -out server.crt（证书文件）
+
+对称加密
+客户端需要知道服务端的证书，不安全
+// 服务端
+func main() {
+    creds, err := credentials.NewServerTLSFromFile("server.crt", "server.key")
+    server := grpc.NewServer(grpc.Creds(creds))
+}
+// 客户端
+func main() {
+    creds, err := credentials.NewClientTLSFromFile("server.crt", "server.grpc.io")
+    conn, err := grpc.Dial("localhost:5000",grpc.WithTransportCredentials(creds),
+    )
+    defer conn.Close()
+}
+
+CA证书
+可以通过一个安全可靠的根证书分别对服务器和客户端的证书进行签名
+生成根证书CA
+$ openssl genrsa -out ca.key 2048（签名文件）
+$ openssl req -new -x509 -days 3650 
+    -subj "/C=GB/L=China/O=gobook/CN=github.com" 
+    -key ca.key 
+    -out ca.crt
+
+对服务端证书签名
+$ openssl req -new
+    -subj "/C=GB/L=China/O=server/CN=server.io"
+    -key server.key
+    -out server.csr
+    
+$ openssl x509 -req -sha256
+    -CA ca.crt -CAkey ca.key -CAcreateserial -days 3650
+    -in server.csr（证书签名请求文件）
+    -out server.crt
+    
+    
+// 对客户端也类似，把server改成client即可
+$ openssl req -new \
+    -subj "/C=GB/L=China/O=client/CN=client.io" \
+    -key client.key \
+    -out client.csr
+$ openssl x509 -req -sha256 \
+    -CA ca.crt -CAkey ca.key -CAcreateserial -days 3650 \
+    -in client.csr \
+    -out client.crt
+
+
+此时客户端可以验证服务端证书：
+1. 首先请求服务器的证书
+2. 使用CA根证书对收到的服务器端证书进行验证。
+func main() {
+    certificate, err := tls.LoadX509KeyPair("client.crt", "client.key")
+
+    ca, err := ioutil.ReadFile("ca.crt")
+    certPool := x509.NewCertPool()
+    if ok := certPool.AppendCertsFromPEM(ca); !ok {
+        log.Fatal("failed to append ca certs")
+    }
+
+    creds := credentials.NewTLS(&tls.Config{
+        Certificates:       []tls.Certificate{certificate},// 客户端证书
+        ServerName:         tlsServerName, // 服务器名字
+        RootCAs:            certPool, // CA证书
+    })
+
+    conn, err := grpc.Dial("localhost:5000", grpc.WithTransportCredentials(creds))
+    defer conn.Close()
+
+    ...
+}
+
+服务端也可以验证客户端证书，流程与上述类似
+    server := grpc.NewServer(grpc.Creds(creds))
+
+RPC方法的安全认证——token
+要实现对每个gRPC方法进行认证，需要实现grpc.PerRPCCredentials接口：
+type Authentication struct {
+    User     string
+    Password string
+}
+
+// 认证的token信息
+func (a *Authentication) GetRequestMetadata(context.Context, ...string) (map[string]string, error) {
+    return map[string]string{"user":a.User, "password": a.Password}, nil
+}
+// 是否要求证书认证
+func (a *Authentication) RequireTransportSecurity() bool {
+    return false
+}
+
+可以自定义认证方法
+func (a *Authentication) Auth(ctx context.Context) error {
+    // 从ctx上下文中获取元信息
+    md, ok := metadata.FromIncomingContext(ctx)
+    // 取出相应的认证信息，这里取出token里的login和password
+    var appid string
+    var appkey string
+    if val, ok := md["login"]; ok { appid = val[0] }
+    if val, ok := md["password"]; ok { appkey = val[0] }
+    // 认证
+    if appid != a.Login || appkey != a.Password {
+        return grpc.Errorf(codes.Unauthenticated, "invalid token")
+    }
+    return nil
+}
+
+启用：
+通过grpc.WithPerRPCCredentials函数实现
+func main() {
+    auth := Authentication{Login: "gopher",Password: "password"}
+    conn, err := grpc.Dial("localhost"+port, grpc.WithInsecure(), grpc.WithPerRPCCredentials(&auth))
+    defer conn.Close()
+    ...
+}
+
+type grpcServer struct { auth *Authentication }
+
+func (p *grpcServer) SomeMethod(ctx context.Context, in *HelloRequest) (*HelloReply, error) {
+    // 在调用方法前进行token认证
+    if err := p.auth.Auth(ctx); err != nil {
+        return nil, err
+    }
+    return &HelloReply{Message: "Hello " + in.Name}, nil
+}
+
+拦截器
+可以在服务中校验参数、token等
+定义拦截逻辑
+- 普通方法：grpc.UnaryInterceptor
+- 流式方法：grpc.StreamInterceptor
+func filter(ctx context.Context,req interface{}, 
+    info *grpc.UnaryServerInfo, // 目标方法
+    handler grpc.UnaryHandler, // 当前方法
+) (resp interface{}, err error) {
+// 具体实现逻辑
+    log.Println("fileter:", info)
+     defer func() {
+        if r := recover(); r != nil {
+            err = fmt.Errorf("panic: %v", r)
+        }
+    }()   
+    return handler(ctx, req)
+}
+
+使用
+通过grpc.UnaryInterceptor()使用拦截器
+server := grpc.NewServer(grpc.UnaryInterceptor(filter))
+
+也可以通过grpc-ecosystem链式拦截
+import "github.com/grpc-ecosystem/go-grpc-middleware"
+
+myServer := grpc.NewServer(
+    // 普通方法
+    grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(filter1, filter2, ...))
+    // 流式方法
+    grpc.StreamInterceptor(grpc_middleware.ChainStreamServer(filter1, filter2, ...))
+)
+
+RPC与HTTP
+gRPC构建在HTTP/2协议之上，可以和HTTP监听同一个端口。
+gRPC服务已经实现了ServeHTTP方法，可以直接作为Web路由处理对象
+func main() {
+    // 启动一个HTTPS的服务器
+    mux := http.NewServeMux()
+    mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
+        fmt.Fprintln(w, "hello")
+    })
+    
+    // 启动一个GRPC服务器
+    creds, err := credentials.NewServerTLSFromFile("server.crt", "server.key")
+    grpcServer := grpc.NewServer(grpc.Creds(creds))
+    
+    // HTTP开始监听端口
+    http.ListenAndServeTLS(port, "server.crt", "server.key",
+        http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            // 非HTTP2，则只能走HTTP服务
+            if r.ProtoMajor != 2 || 
+                // 非GRPC请求，走HTTP服务
+                !strings.Contains(r.Header.Get("Content-Type"), "application/grpc"）{
+                mux.ServeHTTP(w, r)
+                return
+            }{
+                // GRPC请求，走RPC服务
+                grpcServer.ServeHTTP(w, r)
+                return
+            }),
+    )
+}
+
+Restful服务
+gRPC服务一般用于集群内通信，对于外部可以类似http协议提供restful接口，由网关来进行转化。
+可以通过grpc-gateway项目实现
+go get -u github.com/grpc-ecosystem/grpc-gateway/protoc-gen-grpc-gateway
+
+
+
+1. 在Protobuf文件中添加路由相关的元信息
+2. 生成代码
+3. 网关负责转发
+添加路由信息
+syntax = "proto3";
+package main;
+import "google/api/annotations.proto";
+message StringMessage {
+  string value = 1;
+}
+service RestService {
+    rpc Get(StringMessage) returns (StringMessage) {
+        option (google.api.http) = {
+            get: "/get/{value}"
+        };
+    }
+    rpc Post(StringMessage) returns (StringMessage) {
+        option (google.api.http) = {
+            post: "/post"
+            body: "*"
+        };
+    }
+}
+
+
+生成代码
+$ protoc -I/usr/local/include -I. \
+    -I$GOPATH/src \
+    -I$GOPATH/src/github.com/grpc-ecosystem/grpc-gateway/third_party/googleapis \
+    --grpc-gateway_out=. --go_out=plugins=grpc:.\
+    hello.proto
+
+此时会生成转发服务
+func RegisterRestServiceHandlerFromEndpoint(
+    ctx context.Context, mux *runtime.ServeMux, 
+    endpoint string, opts []grpc.DialOption) (err error) {
+    ...
+}
+
+启动服务
+启动中转路由服务
+func main() {
+    ctx := context.Background()
+    ctx, cancel := context.WithCancel(ctx)
+    defer cancel()
+    // 创建路由处理器
+    mux := runtime.NewServeMux()
+    // 中转rpc， rpc服务5000
+    err := RegisterRestServiceHandlerFromEndpoint(
+        ctx, mux, "localhost:5000",
+        []grpc.DialOption{grpc.WithInsecure()},
+    )
+    // 启动HTTP服务8080
+    http.ListenAndServe(":8080", mux)
+}
+
+开启rpc服务
+func main() {
+    grpcServer := grpc.NewServer()
+    RegisterRestServiceServer(grpcServer, new(RestServiceImpl))
+    lis, _ := net.Listen("tcp", ":5000")
+    grpcServer.Serve(lis)
+}
+
+type RestServiceImpl struct{}
+
+func (r *RestServiceImpl) Get(ctx context.Context, message *StringMessage) (*StringMessage, error) {
+    return &StringMessage{Value: "Get hi:" + message.Value + "#"}, nil
+}
+
+func (r *RestServiceImpl) Post(ctx context.Context, message *StringMessage) (*StringMessage, error) {
+    return &StringMessage{Value: "Post hi:" + message.Value + "@"}, nil
+}
+
+添加swagger
+$ go get -u github.com/grpc-ecosystem/grpc-gateway/protoc-gen-swagger
+
+$ protoc -I.
+  -I$GOPATH/src/github.com/grpc-ecosystem/grpc-gateway/third_party/googleapis
+  --swagger_out=. 
+  hello.proto（生成一个hello.swagger.json文件）
+
+
+WEB
+简单的HTTP处理
+可以通过 net/http 来实现，对简单固定的path进行处理
+核心处理器
+func fun(wr http.ResponseWriter, r *http.Request) {
+    // 获取请求
+    msg, err := ioutil.ReadAll(r.Body)
+    // ...
+    // 返回响应
+    writeLen, err := wr.Write(msg)
+}
+
+路由
+func main() {
+    http.HandleFunc("/", fun)
+    err := http.ListenAndServe(":8080", nil)
+    
+    server.mux.HandleFunc("/", fun)
+    
+    server.mux.Handle("/", appHandler{server.app, fun})        
+}
+
+路由 HttpRouter
+可以支持restful风格的path
+特点
+- wildcard参数：不过需要避免“路由冲突”，即两个路由拥有一致的http方法，但是其中一个的路径是可变参数，此时无法正确路由，会发生panic
+GET /user/info/:name
+POST /user/:id
+
+- 通配符：*只能在末尾，同样是避免无法路由的情况
+/src/*filepath
+
+- 回调函数
+r := httprouter.New()
+// 404
+r.NotFound = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+    //..
+})
+// panic
+r.PanicHandler = func(w http.ResponseWriter, r *http.Request, c interface{}) {
+    //..
+}
+
+原理
+底层数据结构为压缩字典树（Radix Tree），在字典树的基础上，每个树节点不是字母而是一个字符串，能够很好的压缩树的深度，在加快字符串查找速度的同时节省空间。
+
+type Router struct {
+    // string为HTTP方法，node为树节点
+    trees map[string]*node
+    // ...
+}
+type node struct {
+    path string // 路径
+    wildChild bool // 子节点是否为参数节点
+    nType string // 当前节点类型 static普通字符串节点/root根节点/param参数节点/catchAll通配符
+    indices string //节点的wildChild=false时，将每个子节点的首字母放在该索引数组中
+}
+
+创建根节点
+在第一次请求方法的时候，就会创建根节点
+r.PUT("/bookshop/user/:user_id/books/:book", fun)
+
+无法复制加载中的内容
+r.GET("/bookshop/users", fun)
+
+无法复制加载中的内容
+插入子节点
+r.GET("/bookshop/users/:user_id/books", fun)
+
+无法复制加载中的内容
+节点分裂
+r.GET("/search", fun)
+
+无法复制加载中的内容
+r.GET("/status", fun)
+
+无法复制加载中的内容
+子节点冲突
+初始化的时候发生panic
+- 在插入catchAll节点时，父节点有子节点
+- 在插入static节点时，父节点的wildChild=true（有可变参数孩子）
+- 在插入static节点时，父节点的子节点nType=catchAll（有通配符孩子）
+- 在插入wildcard节点时，父节点有子节点，且wildChild=false（有正常孩子或通配符孩子）
+- 在插入wildcard节点时，父节点有子节点且wildChild=true，但是wildchild名字有区别（有不同名字的可变参数孩子）
+中间件 Middleware
+将业务代码与公共代码分离，对handler进行包装
+适配器模式
+我们可以通过function adapter的方法来对fun()进行包装，这样所有公共逻辑可以放在同一个适配器中。
+func fun(wr http.ResponseWriter, r *http.Request) {
+}
+
+func helloMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(wr http.ResponseWriter, r *http.Request) {
+        //...公共代码
+        // 业务代码
+        next.ServeHTTP(wr, r)
+    })
+}
+
+func main() {
+    http.Handle("/", helloMiddleware(http.HandlerFunc(fun)))
+    err := http.ListenAndServe(":8080", nil)
+    ...
+}
+
+强制转化Handler
+为什么需要强制转化？
+在http库需要调用你的handler函数来处理http请求时，会调用HandlerFunc()的ServeHTTP()函数
+我们的handler没有直接实现ServeHTTP这个接口
+type Handler interface {
+    ServeHTTP(ResponseWriter, *Request)
+}
+
+type HandlerFunc func(ResponseWriter, *Request)
+
+func (f HandlerFunc) ServeHTTP(w ResponseWriter, r *Request) {
+    f(w, r)
+}
+
+handleFunc与handlerFunc？
+正常情况下，会通过HandleFunc方法来转化自定义handler
+func main() {
+    http.HandleFunc("/", helloHandler)
+}
+
+func HandleFunc(pattern string, handler func(ResponseWriter, *Request)) {
+    DefaultServeMux.HandleFunc(pattern, handler)
+}
+// 调用
+func (mux *ServeMux) HandleFunc(pattern string, handler func(ResponseWriter, *Request)) {
+    mux.Handle(pattern, HandlerFunc(handler))
+}
+
+而在这里，main强制转化指定handler为http.HandlerFunc，或者说是http. Handler
+func main(){
+    http.Handle("/", helloMiddleware(http.HandlerFunc(fun)))    
+}
+
+责任链模式
+可以通过多个函数对handler进行包装
+// 最终处理器
+customizedHandler = logger(timeout(ratelimit(helloHandler)))
+
+更优雅的方式：
+type middleware func(http.Handler) http.Handler
+type Router struct {
+    // 中间件链表
+    middlewareChain [] middleware
+    // 最终处理器
+    mux map[string] http.Handler
+}
+// 添加中间件规则
+func (r *Router) Use(m middleware) {
+    r.middlewareChain = append(r.middlewareChain, m)
+}
+// 包装处理器
+func (r *Router) Add(route string, h http.Handler) {
+    var mergedHandler = h
+    //逐层包装
+    for i := len(r.middlewareChain) - 1; i >= 0; i-- {
+        mergedHandler = r.middlewareChain[i](mergedHandler)
+    }
+    // 路由到最终处理器
+    r.mux[route] = mergedHandler
+}
+
+使用
+r = NewRouter()
+r.Use(logger)
+r.Use(timeout)
+r.Add("/", helloHandler)
+
+请求校验 Validator
+可以通过validator库来实现参数的校验
+import "gopkg.in/go-playground/validator.v9"
+
+type HeroReq struct {
+    // 字符串的 gt=0 表示长度必须 > 0，gt = greater than
+    Username       string   `validate:"gt=0"`
+    // 合法 email 格式校验
+    Email          string   `validate:"email"`
+}
+
+validate := validator.New()
+func validate(req HeroReq) error {
+    err := validate.Struct(req)
+    if err != nil {
+        return err
+    }
+}
+
+原理
+每个结构体都是一棵树，嵌套结构体即为其子节点，通过遍历各个子节点，对字段进行校验
+type TreeNode struct {
+    Email string `validate:"email"`
+}
+type Root struct {
+    Age    int `validate:"eq=10"`
+    Node   TreeNode
+}
+
+无法复制加载中的内容
+func validate(v interface{}) (bool, string) {
+    struct_type := reflect.TypeOf(v)
+    struct_value := reflect.ValueOf(v)
+    
+    // 遍历结构体的所有字段
+    for i := 0; i < struct_value.NumField(); i++ {
+        // 字段
+        fieldVal := struct_value.Field(i)
+        // 获取校验目标
+        tagContent := struct_type.Field(i).Tag.Get("validate")
+        // 字段类型
+        k := fieldVal.Kind()
+
+        switch k {
+        case reflect.Int:
+            val := fieldVal.Int()
+            tagValStr := strings.Split(tagContent, "=")
+            tagVal, _ := strconv.ParseInt(tagValStr[1], 10, 64)
+            if val != tagVal {
+                //校验失败
+            }
+        case reflect.String:
+            val := fieldVal.String()
+            tagValStr := tagContent
+            switch tagValStr {
+            case "email":
+                nestedResult := validateEmail(val)
+                if nestedResult == false {
+                    // 校验失败
+                }
+            }
+        case reflect.Struct:
+            // 如果有内嵌的 struct，那么深度优先遍历
+            valInter := fieldVal.Interface()
+            nestedResult, msg := validate(valInter)
+            if nestedResult == false {
+                // 校验失败
+            }
+        }
+    }
+    return validateResult, errmsg
+}
+
+数据库 db
+简单使用DB
+可以通过 database/sql 库来实现，实际只提供了一套操作数据库的接口和规范（比如连接池、SQL预处理、事务等）
+1. 引入驱动。需要某种SQL时需要引入其驱动
+import (
+    "database/sql"
+    _ "github.com/go-sql-driver/mysql"
+)
+
+MySQL包会调用init函数，注册驱动
+func init() {
+    sql.Register("mysql", &MySQLDriver{})
+}
+
+2. 打开连接。接着通过open函数，打开连接
+db, err := sql.Open("mysql","user:password@tcp(127.0.0.1:3306)/hello")
+defer db.Close()
+
+会返回一个 sql.DB 类型的线程安全的对象，且内部包含了一个连接池
+type Driver interface {
+    Open(name string) (Conn, error)
+}
+
+type Conn interface {
+    Prepare(query string) (Stmt, error)
+    Close() error
+    Begin() (Tx, error)
+}
+
+3. 执行sql
+    rows, err := db.Query("select id, name from users where id = ?", 1)
+    defer rows.Close()
+
+4. 读取结果
+必须要把 rows 里的内容读完，或者显式调用 Close() 方法，否则在 defer 的 rows.Close() 执行之前，连接永远不会释放
+    var (id int, name string)
+    for rows.Next() {
+        err := rows.Scan(&id, &name)
+    }
+
+    err = rows.Err()
+    if err != nil {
+        log.Fatal(err)
+    }
+
+
+屏蔽细节的DB
+ORM
+o := orm.NewOrm()
+num, err := o.QueryTable("cardgroup").Filter("Cards__Card__Name", cardName).All(&cardgroups)
+
+- 太过于屏蔽细节（可能有多表查询但无感知）
+- 会有性能风险（可能会一次性查询数量很多的结果，或者一次只能查询一条结果）
+
+SQLBuilder
+where := map[string]interface{} {
+    "product_id = ?" : 10,
+    "user_id = ?" : 1232 ,
+}
+res, err := historyModel.GetList(where, limit, orderBy)
+
+- 适用于系统的QPS不高，查询不复杂
+
+服务流量限制 Ratelimit
+方式
+- 漏桶：装满水的桶，以固定时间每次漏一滴水，接到水的服务即可请求，否则需要等待
+- 令牌桶：以匀速添加令牌，令牌桶的数量可以动态调整，获得令牌的服务即可请求，否则需要等待
+
+
+我们可以借助 /juju/ratelimit包来实现
+丢令牌
+默认令牌桶，每隔 fillInterval 向令牌桶丢一个令牌，直到 capacity
+func NewBucket(fillInterval time.Duration, capacity int64) *Bucket
+
+N令牌桶，每隔 fillInterval 向令牌桶丢 quantum 个令牌，直到 capacity
+func NewBucketWithQuantum(fillInterval time.Duration, capacity, quantum int64) *Bucket
+
+比率令牌桶，会按照提供的比例，每秒钟填充n个令牌数 （capacity * rate）
+func NewBucketWithRate(rate float64, capacity int64) *Bucket
+
+拿令牌
+每次拿 count 令牌，失败则等待maxWait
+func (tb *Bucket) TakeMaxDuration(count int64, maxWait time.Duration) (
+    time.Duration, bool,
+) {}
+
+每次拿 count 令牌，失败则等待maxWait
+func (tb *Bucket) WaitMaxDuration(count int64, maxWait time.Duration) bool {}
+
+原理
+对全局计数的加减法操作过程
+buffered channel实现
+令牌桶：
+    var capacity = 100
+    var tokenBucket = make(chan struct{}, capacity)
+
+丢令牌：每过一段时间向channel中添加token，如果满了，那么直接放弃
+func main() {
+    var fillInterval = time.Millisecond * 10
+    fillToken := func() {
+        ticker := time.NewTicker(fillInterval)
+        for {
+            // 到达时间
+            select {
+            case <-ticker.C:
+                select {
+                // 丢令牌
+                case tokenBucket <- struct{}{}:
+                default:
+                }
+            }
+        }
+    }
+
+    go fillToken()
+}
+
+拿令牌：直接从channel里拿token
+func TakeAvailable(block bool) bool{
+    var takenResult bool
+    // 阻塞，直到能拿再返回
+    if block {
+        select {
+        case <-tokenBucket:
+            takenResult = true
+        }
+    }
+    // 非阻塞，拿不到就不等了 
+    else {
+        select {
+        case <-tokenBucket:
+            takenResult = true
+        default:
+            takenResult = false
+        }
+    }
+
+    return takenResult
+}
+
+读写锁计数实现
+丢令牌：
+上一次放令牌的时间为 t1，当时的令牌数k1
+放令牌的时间间隔为10，每次向令牌桶中放x个令牌
+    var capacity = 100
+    var k1 = 0
+    var x = 10
+    var ti = 10
+    var t1 time
+func main {
+    var fillInterval = time.Millisecond * ti
+    fillToken := func() {
+        ticker := time.NewTicker(fillInterval)
+        for {
+            // 到达时间
+            select {
+            case <-ticker.C:
+                t1 = time.Now()
+                k1 += x
+            }
+        }
+    }
+    go fillToken()    
+}
+
+取令牌：判断当前是否有令牌
+// 来取n个令牌，我们将这个时刻记为t2。
+func Take(n int) bool{
+    // 获取当前令牌数量
+    t2 := time.Now()
+    cur = k1 + ((t2 - t1)/ti) * x
+    cur = cur > capacity ? capacity : cur
+    
+    if cur >= n {
+        return true
+    }
+    return false
+}
+
+请求协议处理 Protocol
+
+
+需要有一层protocol来处理多种协议，并转化为request和response，对controller没有感知。
+例如对于HTTP协议：
+1. 初始化上下文
+2. 解析request并映射为controller的request
+3. 执行controller
+4. 解析controller的response并映射为response
+type CreateOrderRequest struct {
+    OrderID int64 `json:"order_id"`
+}
+
+type CreateOrderParams struct {
+    OrderID int64
+}
+
+func HTTPCreateOrderHandler(wr http.ResponseWriter, r *http.Request) {
+    var req CreateOrderRequest
+    var params CreateOrderParams
+    // 创建上下文
+    ctx := context.TODO()
+    // 绑定请求体数据
+    bind(r, &req)
+    // 将请求体映射成参数
+    map(req, params)
+    // 核心逻辑
+    logicResp,err := controller.CreateOrder(ctx, &params)
+    if err != nil {}
+}
+
+而对于thrift协议，由于他有自己的IDL文件，可以自动生成结构体，但是也需要进行映射
+
+可以进行抽象：
+- 整合两个协议，分别生成代码
+可以通过Go语言内置的Parser读取文本文件中的Go源代码，然后根据AST来生成目标代码
+也可以把源结构体和Generator的代码放在一起编译
+// http 请求结构体
+type CreateOrder struct {
+    OrderID   int64  `json:"order_id" validate:"required"`
+}
+
+// thrift 请求结构体
+type FeatureSetParams struct {
+    OrderID   int64  `thrift:"OrderID,1,required"`
+}
+
+// controller input struct
+type CreateOrderParams struct {
+    OrderID int64
+}
+
+// ----------------------整合------------------------
+type FeatureSetParams struct {
+    OrderID   int64  `thrift:"OrderID,1,required" json:"order_id"`
+}
+
+- 直接解析thrift的IDL文件
+手写一个thrift的IDL的Parser，生成一套HTTP接口的结构体
+分布式
+分布式ID
+能够支持业务中的高并发场景，ID不会重复，并且能够带有时间信息，便于分库分表或者排序
+雪花算法 snowflake
+
+
+bit
+
+含义
+备注
+1
+
+符号位
+忽略
+4
+timestamp
+时间戳
+
+5
+datacenter_id
+数据中心
+从获取数据中心id的API拿到
+5
+worker_id
+机器实例
+自增id
+12
+sequence_id
+循环自增id
+
+
+实现
+标准snowflake
+可以通过github.com/bwmarrin/snowflake来使用
+func main() {
+    n, err := snowflake.NewNode(1)
+    for i := 0; i < 3; i++ {
+        id := n.Generate()
+        fmt.Println("id", id)
+        fmt.Println("node: ", id.Node(),"step: ", id.Step(),"time: ", id.Time())
+    }
+}
+
+sonyflake
+
+
+时间只用了39个bit，但时间的单位变成了10ms。默认从2014-09-01开始
+默认将本机IP的低16位作为machine id，可自定义（这里支持检查是否冲突，可以通过Redis的集合SADD命令来判断）
+redis 127.0.0.1:6379> SADD base64_encoding_of_last16bits MzI0Mgo=
+(integer) 1
+redis 127.0.0.1:6379> SADD base64_encoding_of_last16bits MzI0Mgo=
+(integer) 0
+
+
+func getMachineID() (uint16, error) {
+    var machineID uint16
+    var err error
+    machineID = readMachineIDFromLocalFile()
+    if machineID == 0 {
+        machineID, err = generateMachineID()
+        if err != nil {
+            return 0, err
+        }
+    }
+    return machineID, nil
+}
+
+func checkMachineID(machineID uint16) bool {
+    saddResult, err := saddMachineIDToRedisSet()
+    if err != nil || saddResult == 0 {
+        return true
+    }
+    err := saveMachineIDToLocalFile(machineID)
+    if err != nil {
+        return true
+    }
+    return false
+}
+
+func main() {
+    settings := sonyflake.Settings{
+        StartTime:      time.Parse("2006-01-02", "2018-01-01"),
+        MachineID:      getMachineID,
+        CheckMachineID: checkMachineID,
+    }
+    sf := sonyflake.NewSonyflake(settings)
+    id, err := sf.NextID()
+}
+
+分布式锁
+在并发或并行修改全局变量时，需要加锁以创造临界区
+单机 lock
+严格的加锁，获取不到则等待。可以通过 sync.Mutex 来实现
+var wg sync.WaitGroup
+var l sync.Mutex
+for i := 0; i < 1000; i++ {
+    wg.Add(1)
+    go func() {
+        defer wg.Done()
+        l.Lock()
+        counter++
+        l.Unlock()
+    }()
+}
+wg.Wait()
+
+单机 trylock
+尝试获取锁，失败时也不会阻塞。可以通过 长度为1 的 Channel 模拟临界区实现
+type Lock struct {
+    c chan struct{}
+}
+
+func NewLock() Lock {
+    var l Lock
+    l.c = make(chan struct{}, 1)
+    l.c <- struct{}{}
+    return l
+}
+
+func (l Lock) Unlock() {
+    l.c <- struct{}{}
+}
+func (l Lock) Lock() bool {
+    lockResult := false
+    select {
+    case <-l.c:
+        lockResult = true
+    default:
+    }
+    return lockResult
+}
+
+var wg sync.WaitGroup
+var l = NewLock()
+for i := 0; i < 1000; i++ {
+    wg.Add(1)
+    go func() {
+        defer wg.Done()
+        if !l.Lock() {
+            return
+        }
+        counter++
+        l.Unlock()
+    }()
+}
+wg.Wait()
+
+
+分布式 基于ZooKeeper（lock）
+利用临时Sequence节点和watch API，例如我们这里使用的是/lock节点。Lock会在该节点下的节点列表中插入自己的值，只要节点下的子节点发生变化，就会通知所有watch该节点的程序。这时候程序会检查当前节点下最小的子节点的id是否与自己的一致。如果一致，说明加锁成功了。
+适合分布式任务调度场景，但不适合高频次持锁时间短的抢锁场景。粒度过大
+func main() {
+    c, _, err := zk.Connect([]string{"127.0.0.1"}, time.Second) //*10)
+
+    l := zk.NewLock(c, "/lock", zk.WorldACL(zk.PermAll))
+    
+    err = l.Lock()
+    //...
+    l.Unlock()
+}
+
+
+分布式 基于Redis（trylock）
+setnx适合在高并发场景下，用来争抢一些“唯一”的资源。
+func incr() {
+    client := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: "", DB:0})
+    var lockKey = "counter_lock"
+    var counterKey = "counter"
+
+    resp := client.SetNX(lockKey, 1, time.Second*5)
+    lockSuccess, err := resp.Result()
+    if err != nil || !lockSuccess {
+        return
+    }
+
+    getResp := client.Get(counterKey)
+    cntValue, err := getResp.Int64()
+    if err == nil || err == redis.Nil {
+        cntValue++
+        resp := client.Set(counterKey, cntValue, 0)
+        _, err := resp.Result()
+    }
+
+    delResp := client.Del(lockKey)
+    unlockSuccess, err := delResp.Result()
+    if err != nil || unlockSuccess <= 0 {
+        println("unlock failed", err)
+    }
+}
+
+延时任务
+定时器
+可以通过时间堆或时间轮来实现
+时间堆
+由于时间是从小到大的...所以一般都会用小顶堆来实现
+
+一般我们来轮询这个堆时，会从堆顶开始。那么如果当前时间<堆顶，则表示当前时间<整个堆，就不用轮询了。时间复杂度只需要O(1)
+除非时间超过当前堆顶，则表示有些任务需要开始执行了。
+go的定时器通过四叉树来实现
+时间轮
+
+
+每到一个刻度时，判断当前链表有无需要执行的任务。如果不需要的话，时间复杂度只需要O(1)
+需要的时候，会从链表里逐个执行
+分发任务
+可以采用轮询sharding 策略。
+1. 每个实例去db获取interval内需要执行的task（task%shardingCount=shardingId）
+2. 获取task之后，通知用户执行（通过mq或者func回调）
+需要考虑幂等和故障再分配
+
+分布式搜索引擎
+ElasticSearch 原理
+倒排索引
+- 数值
+
+- 非数值：将所有Ti和T(i+1)组成一个词
+
+
+对Elasticsearch中的数据进行查询时，本质就是求多个排好序的序列求交集
+其中， es 的 index 和 type就是数据库中的 database/table 概念。type 本质上只是 document 的一个字段（内容过多会导致性能问题）
+ElasticSearch 使用
+var esClient *elastic.Client
+
+func initElasticsearchClient(host string, port string) {
+    var err error
+    esClient, err = elastic.NewClient(elastic.SetURL(fmt.Sprintf("http://%s:%s", host, port)),elastic.SetMaxRetries(3))
+}
+
+func insertDocument(db string, table string, obj map[string]interface{}) {
+    id := obj["id"]
+
+    var indexName, typeName string
+    indexName = fmt.Sprintf("%v_%v", db, table)
+    typeName = table
+    // 正常情况
+    res, err := esClient.Index().Index(indexName).Type(typeName).Id(id).BodyJson(obj).Do()
+}
+
+func deleteDocument(indexName string, typeName string, obj map[string]interface{}) {
+    id := obj["id"]
+
+    res, err := esClient.Delete().Index(indexName).Type(typeName).Id(id).Do()
+}
+
+func query(indexName string, typeName string) (*elastic.SearchResult, error) {
+    // 通过 bool must 和 bool should 添加 bool 查询条件
+    q := elastic.NewBoolQuery()
+    q = q.Must(elastic.NewMatchPhraseQuery("id", 1), elastic.NewBoolQuery().Must(elastic.NewMatchPhraseQuery("male", "m")))
+    q = q.Should(elastic.NewMatchPhraseQuery("name", "alex"), elastic.NewMatchPhraseQuery("name", "xargin"))
+
+    searchService := esClient.Search(indexName).Type(typeName)
+    res, err := searchService.Query(q).Do()
+    return res, nil
+}
+
+异步同步
+一般ElasticSearch提供读功能，写功能由db异步同步
+时间戳增量同步
+
+
+在一段时间内同步数据，需要db中有时间字段&时间数据准确
+select * from xx where update_time >= date_sub(now(), interval 11 minute);
+
+binlog同步
+binlog改动后发送MQ，kafka消费者收到消息，将主键作为id写入
+
+
+负载均衡
+轮询 Polling
+可以把服务节点信息都存储在数组中，每次请求完成下游之后，移动一个索引
+随机 Random
+rand.Intn()%n
+加权 weight
+对下游节点进行排序，选择权重最大/小的那一个
+洗牌算法
+对索引数组做洗牌，取第一个元素作为服务节点，如果请求失败，选择下一个节点重试。
+正确的洗牌：每次随机挑选一个值，放在数组末尾。然后在n-1个元素的数组中再随机挑选一个值，放在数组末尾。
+func shuffle(slice []int) {
+    for i := 0; i < len(slice); i++ {
+        a := rand.Intn(len(slice))
+        b := rand.Intn(len(slice))
+        slice[a], slice[b] = slice[b], slice[a]
+    }
+}
+
+
+func shuffle(indexes []int) {
+    for i:=len(indexes); i>0; i-- {
+        lastIdx := i - 1
+        rand.Seed(time.Now().UnixNano()) // 种子 真随机
+        idx := rand.Int(i)
+        indexes[lastIdx], indexes[idx] = indexes[idx], indexes[lastIdx]
+    }
+}
+
+func request(params map[string]interface{}) error {
+    var indexes = []int {0,1,2,3,4,5,6}
+    var err error
+
+    shuffle(indexes)
+    maxRetryTimes := 3
+
+    idx := 0
+    for i := 0; i < maxRetryTimes; i++ {
+        err = apiRequest(params, indexes[idx])
+        if err == nil {
+            break
+        }
+        idx++
+    }
+    return nil
+}
+
+
+分布式配置
+Etcd
+func init() {
+    cfg := client.Config{Endpoints: []string{"http://127.0.0.1:2379"}, Transport: client.DefaultTransport,HeaderTimeoutPerRequest: time.Second}
+    c, err := client.New(cfg)
+    kapi = client.NewKeysAPI(c)
+    initConfig()
+}
+
+func initConfig() {
+    resp, err = kapi.Get(context.Background(), configPath, nil)
+    err := json.Unmarshal(resp.Node.Value, &appConfig)
+}
+
+func watchAndUpdate() {
+    w := kapi.Watcher(configPath, nil)
+    go func() {
+        // watch 该节点下的每次变化
+        for {
+            resp, err := w.Next(context.Background())
+            err = json.Unmarshal([]byte(resp.Node.Value), &appConfig)
+        }
+    }()
+}
+
+配置膨胀
+1. 需要对相应的配置进行权限管理
+2. 根据业务量进行配置存储的集群划分
+3. 客户端侧进行缓存优化
+配置容错
+服务端：
+可以用DB来存储 配置文件或配置字符串 -> 版本号的映射关系，发现新配置出问题时，能够及时根据版本号回滚。
+客户端：
+可以在本地磁盘缓存一份，在服务不可用时使用cache，服务可用时再更新
+分布式爬虫
+单机爬虫 colly
+func main() {
+    c := colly.NewCollector(colly.AllowedDomains("www.abcdefg.com"),colly.MaxDepth(1))
+    // 记录
+    var visited = map[string]bool{}
+    // 匹配下面模式的是该网站的列表页
+    listRegex, _ := regexp.Compile(`/t/\d+#\w+`)
+
+    // 所有a标签，上设置回调函数
+    c.OnHTML("a[href]", func(e *colly.HTMLElement) {
+        link := e.Attr("href")
+        // 已访问过的详情页或列表页，跳过
+        if visited[link] && listRegex.Match([]byte(link)) {
+            return
+        }
+        if !listRegex.Match([]byte(link)) {
+            println("not match", link)
+            return
+        }
+        visited[link] = true
+        c.Visit(e.Request.AbsoluteURL(link))
+    })
+
+    err := c.Visit("https://www.abcdefg.com/go/go")
+}
+
+分布式 MQ
+1. 上游根据预先配置好的起点来爬取所有的目标“列表页”
+2. 将列表里的详情页链接作为“任务”内容，通过消息队列分发出去
+
+上游：
+var domain2Collector = map[string]*colly.Collector{}
+
+func init() {
+    domain2Collector["www.abcdefg.com"] = initABCDECollector()
+    nc, err = nats.Connect(natsURL)
+    if err != nil {os.Exit(1)}
+}
+
+func initABCDECollector() *colly.Collector {
+    c := colly.NewCollector(colly.AllowedDomains("www.abcdefg.com"),colly.MaxDepth(maxDepth))
+
+    c.OnResponse(func(resp *colly.Response) {
+        // 做一些爬完之后的善后工作
+    })
+
+    c.OnHTML("a[href]", func(e *colly.HTMLElement) {
+        // 基本的反爬虫策略
+        link := e.Attr("href")
+        time.Sleep(time.Second * 2)
+
+        // 正则 match 列表页的话，就 visit
+        if listRegex.Match([]byte(link)) {
+            c.Visit(e.Request.AbsoluteURL(link))
+        }
+        
+        // 正则 match 落地页的话，就发消息队列
+        if detailRegex.Match([]byte(link)) {
+            err = nc.Publish("tasks", []byte(link))
+            nc.Flush()
+        }
+    })
+    return c
+}
+
+func main() {
+    urls := []string{"https://www.abcdefg.com"}
+    for _, url := range urls {
+        instance := factory(url)
+        instance.Visit(url)
+    }
+}
+
+// 策略模式
+func factory(urlStr string) *colly.Collector {
+    u, _ := url.Parse(urlStr)
+    return domain2Collector[u.Host]
+}
+
+下游
+var domain2Collector = map[string]*colly.Collector{}
+
+func init() {
+    domain2Collector["www.abcdefg.com"] = initV2exCollector()
+    nc, err = nats.Connect(natsURL)
+    if err != nil {os.Exit(1)}
+}
+
+func initV2exCollector() *colly.Collector {
+    c := colly.NewCollector(colly.AllowedDomains("www.abcdefg.com"),colly.MaxDepth(maxDepth))
+    return c
+}
+
+func startConsumer() {
+    nc, err := nats.Connect(nats.DefaultURL)
+    sub, err := nc.QueueSubscribeSync("tasks", "workers")
+
+    var msg *nats.Msg
+    for {
+        // 获取上游信息
+        msg, err = sub.NextMsg(time.Hour * 10000)
+        urlStr := string(msg.Data)
+        
+        ins := factory(urlStr)
+        // 因为最下游拿到的一定是对应网站的落地页
+        // 所以不用进行多余的判断了，直接爬内容即可
+        ins.Visit(urlStr)
+    }
+}
+
+其他
+代码优化
+对于火箭型代码（多层if-else）：抽为函数，遵循fast-fail原则
+对于lint（多个Switch）：表驱动设计（可能需要多次hash key，考虑性能）
+对于模块：抽成方法，进而面向接口设计
+灰度发布
+1. 分批次
+2. 随机
+- 按概率发布，主要在于种子的初始化
+func init() {
+    rand.Seed(time.Now().UnixNano())
+}
+
+// rate 为 0~100
+func isPassed(rate int) bool {
+    if rate >= 100 {
+        return true
+    }
+    if rate > 0 && rand.Int(100) > rate {
+        return true
+    }
+    return false
+}
+
+3. 定制业务规则
+- 按照千分比
+利用用户id、手机号、用户设备信息，来生成hash再求模。可以保证同一个用户的返回结果多次调用是一致的，按照指定的百分比，返回对应的true和false
+func passed(phone string) bool {
+    key := hashFunctions(phone) % 1000
+    if key <= 2 {
+        return true
+    }
+    return false
+}
+
+func isTrue(phone string) bool {
+    if passed(phone) {
+        return true
+    }
+
+    return false
+}
+
+- 按白名单发布
+- 按城市、业务线、分发渠道、UA(APP、Web、PC)发布
+读取配置，再进行判断
+var cityID2Open = [12000]bool{}
+
+func init() {
+    readConfig()
+    for i:=0;i<len(cityID2Open);i++ {
+        if city i is opened in configs {
+            cityID2Open[i] = true
+        }
+    }
+}
+
+func isPassed(cityID int) bool {
+    return cityID2Open[cityID]
+}
+
+
